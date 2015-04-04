@@ -1,0 +1,714 @@
+Subject: [patch @num@/@total@] @name@ Add remote ptrace support (Attach and Stop)
+
+This patch is intended to add the ability to trace a remote process
+from the deputy.
+
+This is the Attach and Stop part (PTRACE_ATTACH and do_notify_parent_cldstop)
+
+Mostly adding L1 commands ... 
+---
+ hpc/Makefile            |    2 
+ hpc/kcomd.c             |   22 ++++++
+ hpc/migsend.c           |    3 
+ hpc/ptrace.c            |  166 ++++++++++++++++++++++++++++++++++++++++++++++++
+ hpc/task.c              |   16 ----
+ include/hpc/omtask.h    |   10 ++
+ include/hpc/protocol.h  |   28 ++++++++
+ include/hpc/prototype.h |    8 ++
+ kernel/exit.c           |   66 +++++++++++++++----
+ kernel/ptrace.c         |   31 ++++++++
+ kernel/signal.c         |   48 +++++++++++++
+ 11 files changed, 366 insertions(+), 34 deletions(-)
+
+
+Index: linux/hpc/kcomd.c
+===================================================================
+--- linux.orig/hpc/kcomd.c	2007-01-05 14:54:00.000000000 +0100
++++ linux/hpc/kcomd.c	2007-01-09 18:10:46.000000000 +0100
+@@ -335,6 +335,17 @@
+                 .recv_size = sizeof(struct omp_signal),
+ 		.name = "Signal"},
+ 
++	/************************************/
++	/*         Ptrace commands          */
++	/************************************/
++
++        /* Attach a remote process */
++	[KCOM_L1_CMD_INDEX(KCOM_L1_PTRACE_ATTACH)] = {
++		.handle_pkt = remote_ptrace_attach,
++		.cmd_flags = KCOM_ASYNC_SIMPLE,
++                .recv_size = sizeof(int),
++		.name = "Deputy Ptrace Attach"},
++
+ };
+ EXPORT_SYMBOL_GPL(kcomd_l1_handlers);
+ 
+@@ -625,7 +636,8 @@
+ 	return kcomd_l2_handlers[index].handle_pkt(tsk, pkt);
+ 
+ error:
+-	kcom_send_nack(tsk->task, pkt);
++	if (KCOM_ASYNC_SIMPLE != __kcom_cmd_flags(pkt->type))
++		kcom_send_nack(tsk->task, pkt);
+ 	return err;
+ 
+ 
+@@ -805,6 +817,14 @@
+                 .recv_size =sizeof(struct omp_usercopy_req),
+                 .answer_size = sizeof(long),
+ 		.name = "Remote strlen_user"},
++
++	/* ptrace things : */
++	[KCOM_L2_CMD_INDEX(KCOM_L2_NOTIFY_CLDSTOP)] = {
++		.handle_pkt = deputy_do_notify_parent_cldstop,
++		.cmd_flags = KCOM_ASYNC_SIMPLE,
++		.perms = DDEPUTY,
++                .recv_size = sizeof(struct omp_do_notify_parent_cldstop),
++		.name = "Remote do_notify_parent_cldstop"},
+ };
+ 
+ 
+Index: linux/hpc/migsend.c
+===================================================================
+--- linux.orig/hpc/migsend.c	2007-01-05 22:47:42.000000000 +0100
++++ linux/hpc/migsend.c	2007-01-08 19:33:03.000000000 +0100
+@@ -55,6 +55,9 @@
+ 
+ 	OMDEBUG_MIG(3, "sending process %d\n", p->pid);
+ 
++	/* save for may_attach usage */
++	current->om.old_dumpable = current->mm->dumpable;
++
+ 	return kcom_send_command(KCOM_L2_MIG_MM, sizeof(struct omp_mig_mm)
+ 				,(char *)&p->mm->start_code, 0, dest_ptr, NULL);
+ }
+Index: linux/hpc/ptrace.c
+===================================================================
+--- /dev/null	1970-01-01 00:00:00.000000000 +0000
++++ linux/hpc/ptrace.c	2007-01-09 19:32:53.000000000 +0100
+@@ -0,0 +1,166 @@
++/*
++ *	Copyright (C) 2006-2007 Florian Delizy <fdy@e8dev.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published
++ * by the Free Software Foundation; version 2 only.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++
++/**
++ * deputy_may_attach - check if the deputy can be attached (send a
++ * request to the remote to check some fields)
++ **/
++
++#include <linux/config.h>
++#include <linux/kernel.h>
++#include <linux/ptrace.h>
++#include <linux/signal.h>
++
++#include <hpc/protocol.h>
++#include <hpc/kcom.h>
++#include <hpc/prototype.h>
++
++void do_notify_parent_cldstop(struct task_struct *tsk, int why);
++
++void deputy_ptrace_attach(struct task_struct *task)
++{
++	struct sockaddr_in *dest_ptr=(void *)task->om.whereto;
++	struct kcom_task *tsk;
++	int cple = capable(CAP_SYS_PTRACE);
++
++	write_unlock_irq(&tasklist_lock);
++	local_irq_enable();
++	task_unlock(task);
++
++	tsk = kcom_task_find(task->pid);
++	if (!tsk)
++		return;
++
++	__kcom_send_command(tsk, KCOM_L1_PTRACE_ATTACH, sizeof(int), (char*)&cple, 0, dest_ptr, NULL);
++
++repeat:
++	/* (from kernel/ptrace.c)
++	 * Nasty, nasty.
++	 *
++	 * We want to hold both the task-lock and the
++	 * tasklist_lock for writing at the same time.
++	 * But that's against the rules (tasklist_lock
++	 * is taken for reading by interrupts on other
++	 * cpu's that may have task_lock).
++	 */
++	task_lock(task);
++	local_irq_disable();
++	if (!write_trylock(&tasklist_lock)) {
++		local_irq_enable();
++		task_unlock(task);
++		do {
++			cpu_relax();
++		} while (!write_can_lock(&tasklist_lock));
++		goto repeat;
++	}
++
++
++}
++
++
++int remote_ptrace_attach(struct kcom_node *node, const struct kcom_pkt * const pkt)
++{
++	int *capable = (int *) pkt->data;
++	struct kcom_task *task;
++
++	task = __find_task_for_packet(pkt, node, NULL);
++
++	if (!task)
++		return -ESRCH;
++
++repeat:
++	/* (from kernel/ptrace.c) :
++	 * Nasty, nasty.
++	 *
++	 * We want to hold both the task-lock and the
++	 * tasklist_lock for writing at the same time.
++	 * But that's against the rules (tasklist_lock
++	 * is taken for reading by interrupts on other
++	 * cpu's that may have task_lock).
++	 */
++	task_lock(task->task);
++	local_irq_disable();
++	if (!write_trylock(&tasklist_lock)) {
++		local_irq_enable();
++		task_unlock(task->task);
++		do {
++			cpu_relax();
++		} while (!write_can_lock(&tasklist_lock));
++		goto repeat;
++	}
++
++	task->task->ptrace |= PT_PTRACED | PT_ATTACHED;
++	if (*capable)
++		task->task->ptrace |= PT_PTRACE_CAP;
++
++	force_sig_specific(SIGSTOP, task->task);
++
++	write_unlock_irq(&tasklist_lock);
++	task_unlock(task->task);
++
++	return 0;
++}
++
++
++void remote_do_notify_parent_cldstop(struct task_struct *tsk, int why)
++{
++	struct omp_do_notify_parent_cldstop s;
++	struct kcom_task *task = kcom_task_find( tsk->pid );
++	struct sockaddr_in *dest_ptr=(void *)tsk->om.whereto;
++
++	if (!task)
++		return;
++
++	s.why = why;
++	s.utime = tsk->utime;
++	s.stime = tsk->stime;
++	s.state = tsk->state;
++	s.ptrace = tsk->ptrace;
++	s.exit_code = tsk->exit_code;
++	s.exit_state = tsk->exit_state;
++
++ 	switch (why) {
++ 	case CLD_CONTINUED:
++ 		s.sig_status = SIGCONT;
++ 		break;
++ 	case CLD_STOPPED:
++ 		s.sig_status = tsk->signal->group_exit_code & 0x7f;
++ 		break;
++ 	case CLD_TRAPPED:
++ 		s.sig_status = tsk->exit_code & 0x7f;
++ 		break;
++ 	}
++	kcom_send_command(KCOM_L2_NOTIFY_CLDSTOP, sizeof(s), (char *)&s, 0, dest_ptr, NULL);
++}
++
++int deputy_do_notify_parent_cldstop(struct kcom_task* tsk, const struct kcom_pkt * const pkt)
++{
++	struct omp_do_notify_parent_cldstop *s;
++	struct task_struct *p = tsk->task;
++
++	s = (struct omp_do_notify_parent_cldstop *) pkt->data;
++
++	p->utime = s->utime;
++	p->stime = s->stime;
++	p->om.sig_status = s->sig_status;
++	p->om.sig_status_ready = 1;
++	p->om.remote_state = s->state;
++	p->om.remote_ptrace = s->ptrace;
++	p->om.remote_exit_state = s->exit_state;
++	p->exit_code = s->exit_code;
++
++	do_notify_parent_cldstop(p, s->why);
++	return 0;
++}
+Index: linux/include/hpc/omtask.h
+===================================================================
+--- linux.orig/include/hpc/omtask.h	2007-01-05 22:43:35.000000000 +0100
++++ linux/include/hpc/omtask.h	2007-01-09 19:30:32.000000000 +0100
+@@ -32,7 +32,15 @@
+ 	struct socket *contact;		/* DEPUTY <==> REMOTE connection */
+ 	struct sockaddr *whereto;	/* sockaddr to send to if DREQ_MOVE */
+ 
+-	wait_queue_head_t wait_dist;	/* misc. wait for process */
++	/* ptrace specific fields */
++
++	unsigned old_dumpable;		/* old mm->dumpable */
++	int sig_status;			/* Used for do_notify_parent_cldstop */
++	int sig_status_ready;		/* set to one when ready, 0 if not */
++	long remote_state;		/* The remote last reported state (ptrace) */
++	unsigned long remote_ptrace;	/* The remote ptrace var */
++	long remote_exit_state;
++
+ 
+ 	struct list_head rfiles;	/* deputy held files */
+ 
+Index: linux/include/hpc/protocol.h
+===================================================================
+--- linux.orig/include/hpc/protocol.h	2007-01-05 14:54:20.000000000 +0100
++++ linux/include/hpc/protocol.h	2007-01-09 19:30:19.000000000 +0100
+@@ -110,6 +110,14 @@
+ 	KCOM_L1_MIG_INIT,	       /* Send to initiate the migration */
+ 	KCOM_L1_MIG_COME_HOME,	       /* Ask the task to go home        */
+ 	KCOM_L1_DEP_SIGNAL,            /* Deputy send a signal to remote */
++
++	/* ptrace support                                                */
++
++	KCOM_L1_PTRACE_ATTACH,	       /* Notify the remote its attached */
++	KCOM_L1_PTRACE_CALL,	       /* execute ptrace on deputy       */
++	KCOM_L1_GET_TASK_STATE,	       /*  get the remote task state     */
++	KCOM_L1_SET_TRACED,	       /* called to set to TASK_TRACED   */
++
+ 	KCOM_L1_CMD_MAX,
+ 
+ 	/* Commands executed in the process context                      */
+@@ -144,6 +150,9 @@
+ 	KCOM_L2_REQ_MMAP,
+ 	KCOM_L2_REQ_DO_EXECVE,
+ 
++
++	KCOM_L2_NOTIFY_CLDSTOP,	       /* Notify deputy of the break     */
++
+ 	KCOM_L2_CMD_MAX,
+ 
+         /* FIXME not handled yet : */
+@@ -299,4 +308,23 @@
+ 	siginfo_t siginfo;
+ };
+ 
++struct omp_ptrace_call
++{
++	unsigned long request;
++	void * addr;
++	void * data;
++};
++
++struct omp_do_notify_parent_cldstop
++{
++	int why;
++	cputime_t utime;
++	cputime_t stime;
++	long state;
++	unsigned long ptrace;
++	long exit_code;
++	long exit_state;
++	int sig_status;
++};
++
+ #endif /*  _HPC_PROTOCOL_H */
+Index: linux/kernel/ptrace.c
+===================================================================
+--- linux.orig/kernel/ptrace.c	2007-01-05 14:54:04.000000000 +0100
++++ linux/kernel/ptrace.c	2007-01-08 19:24:31.000000000 +0100
+@@ -22,6 +22,11 @@
+ #include <asm/pgtable.h>
+ #include <asm/uaccess.h>
+ 
++#ifdef CONFIG_OPENMOSIX
++#include <hpc/kcom.h>
++#include <hpc/prototype.h>
++#endif
++
+ /*
+  * ptrace a task: make the debugger its new parent and
+  * move it to the ptrace list.
+@@ -120,8 +125,16 @@
+ 
+ static int may_attach(struct task_struct *task)
+ {
++#ifndef CONFIG_OPENMOSIX
+ 	if (!task->mm)
+ 		return -EPERM;
++#else
++	int isdeputy = task_test_dflags(task, DDEPUTY);
++
++	if (!task->mm && !isdeputy)
++		return -EPERM;
++#endif /* CONFIG_OPENMOSIX */
++
+ 	if (((current->uid != task->euid) ||
+ 	     (current->uid != task->suid) ||
+ 	     (current->uid != task->uid) ||
+@@ -130,8 +143,19 @@
+ 	     (current->gid != task->gid)) && !capable(CAP_SYS_PTRACE))
+ 		return -EPERM;
+ 	smp_rmb();
++
++#ifndef CONFIG_OPENMOSIX
+ 	if (!task->mm->dumpable && !capable(CAP_SYS_PTRACE))
+ 		return -EPERM;
++#else
++
++	if (!isdeputy && !task->mm->dumpable && !capable(CAP_SYS_PTRACE))
++		return -EPERM;
++
++	if (isdeputy && !task->om.old_dumpable && !capable(CAP_SYS_PTRACE))
++		return -EPERM;
++
++#endif
+ 
+ 	return security_ptrace(current, task);
+ }
+@@ -184,6 +208,13 @@
+ 		goto bad;
+ 
+ 	/* Go */
++#ifdef CONFIG_OPENMOSIX
++	if (task_test_dflags(task, DDEPUTY)) {
++		deputy_ptrace_attach(task);
++		__ptrace_link(task, current);
++		goto bad; /* ok this label is not that 'bad' */
++	}
++#endif
+ 	task->ptrace |= PT_PTRACED | ((task->real_parent != current)
+ 				      ? PT_ATTACHED : 0);
+ 	if (capable(CAP_SYS_PTRACE))
+Index: linux/kernel/signal.c
+===================================================================
+--- linux.orig/kernel/signal.c	2007-01-05 23:19:58.000000000 +0100
++++ linux/kernel/signal.c	2007-01-09 17:40:48.000000000 +0100
+@@ -30,6 +30,10 @@
+ #include <asm/unistd.h>
+ #include <asm/siginfo.h>
+ 
++#ifdef CONFIG_OPENMOSIX
++#include <hpc/prototype.h>
++#endif
++
+ /*
+  * SLAB caches for signal bits.
+  */
+@@ -591,7 +595,7 @@
+ }
+ 
+ /* forward decl */
+-static void do_notify_parent_cldstop(struct task_struct *tsk, int why);
++void do_notify_parent_cldstop(struct task_struct *tsk, int why);
+ 
+ /*
+  * Handle magic process-wide effects of stop/continue signals.
+@@ -1481,14 +1485,24 @@
+ 	spin_unlock_irqrestore(&psig->siglock, flags);
+ }
+ 
+-static void do_notify_parent_cldstop(struct task_struct *tsk, int why)
++void do_notify_parent_cldstop(struct task_struct *tsk, int why)
+ {
+ 	struct siginfo info;
+ 	unsigned long flags;
+ 	struct task_struct *parent;
+ 	struct sighand_struct *sighand;
+ 
++#ifdef CONFIG_OPENMOSIX
++
++	if (task_test_dflags(tsk, DREMOTE)) {
++		remote_do_notify_parent_cldstop(tsk, why);
++		return;
++	}
++
++	if (tsk->ptrace & PT_PTRACED || task_test_dflags(tsk, DDEPUTY))
++#else
+ 	if (tsk->ptrace & PT_PTRACED)
++#endif
+ 		parent = tsk->parent;
+ 	else {
+ 		tsk = tsk->group_leader;
+@@ -1505,6 +1519,14 @@
+ 	info.si_stime = cputime_to_jiffies(tsk->stime);
+ 
+  	info.si_code = why;
++#ifdef CONFIG_OPENMOSIX
++	if (unlikely(task_test_dflags(tsk, DDEPUTY) && tsk->om.sig_status_ready))
++	{
++		tsk->om.sig_status_ready = 0;
++		info.si_status = tsk->om.sig_status;
++		goto sendsig;
++	}
++#endif
+  	switch (why) {
+  	case CLD_CONTINUED:
+  		info.si_status = SIGCONT;
+@@ -1518,7 +1540,9 @@
+  	default:
+  		BUG();
+  	}
+-
++#ifdef CONFIG_OPENMOSIX
++sendsig:
++#endif
+ 	sighand = parent->sighand;
+ 	spin_lock_irqsave(&sighand->siglock, flags);
+ 	if (sighand->action[SIGCHLD-1].sa.sa_handler != SIG_IGN &&
+@@ -1559,11 +1583,28 @@
+ 	spin_unlock_irq(&current->sighand->siglock);
+ 	try_to_freeze();
+ 	read_lock(&tasklist_lock);
++
++#ifdef CONFIG_OPENMOSIX
++	/*
++	 * On remote ptrace, the parent is the same as real_parent,
++	 * but the process is marked as PT_ATTACHED, finally there
++	 * are no real interest in checking current->parent->signal
++	 * since the real parent is not on this computer
++	 */
++	if (likely(current->ptrace & PT_PTRACED) &&
++	    likely( current->parent != current->real_parent ||
++	    	    (task_test_dflags(current, DREMOTE) && (current->ptrace&PT_ATTACHED)) ||
++		   !(current->ptrace & PT_ATTACHED)) &&
++	    (unlikely(task_test_dflags(current, DREMOTE)) ||
++	     likely(current->parent->signal != current->signal) ||
++	     !unlikely(current->signal->flags & SIGNAL_GROUP_EXIT))) { /*}*/
++#else
+ 	if (likely(current->ptrace & PT_PTRACED) &&
+ 	    likely(current->parent != current->real_parent ||
+ 		   !(current->ptrace & PT_ATTACHED)) &&
+ 	    (likely(current->parent->signal != current->signal) ||
+ 	     !unlikely(current->signal->flags & SIGNAL_GROUP_EXIT))) {
++#endif
+ 		do_notify_parent_cldstop(current, CLD_TRAPPED);
+ 		read_unlock(&tasklist_lock);
+ 		schedule();
+@@ -1582,6 +1623,7 @@
+ 	 * last_siginfo, so that we are sure to have synchronized with
+ 	 * any signal-sending on another CPU that wants to examine it.
+ 	 */
++
+ 	spin_lock_irq(&current->sighand->siglock);
+ 	current->last_siginfo = NULL;
+ 
+Index: linux/include/hpc/prototype.h
+===================================================================
+--- linux.orig/include/hpc/prototype.h	2007-01-08 19:21:16.000000000 +0100
++++ linux/include/hpc/prototype.h	2007-01-08 19:27:25.000000000 +0100
+@@ -104,7 +104,8 @@
+ extern int mig_do_receive_init(struct kcom_node*, const struct kcom_pkt* const);
+ extern int mig_do_come_home(struct kcom_node*, const struct kcom_pkt* const);
+ extern int mig_do_l1_error(struct kcom_node*, const struct kcom_pkt* const);
+-int remote_do_signal(struct kcom_node*, const struct kcom_pkt * const);
++extern int remote_do_signal(struct kcom_node*, const struct kcom_pkt * const);
++extern int remote_ptrace_attach(struct kcom_node *, const struct kcom_pkt *const);
+ 
+ /* L2 packet handlers */
+ 
+@@ -129,4 +130,9 @@
+ extern int deputy_do_execve(struct kcom_task*, const struct kcom_pkt *const);
+ extern int remote_strnlen_user(struct kcom_task*, const struct kcom_pkt *const);
+ 
++extern int deputy_do_notify_parent_cldstop(struct kcom_task*, const struct kcom_pkt *const);
++
++
++extern void deputy_ptrace_attach(struct task_struct*);
++extern void remote_do_notify_parent_cldstop(struct task_struct *tsk, int why);
+ #endif /* _HPC_PROTOTYPE_H */
+Index: linux/hpc/task.c
+===================================================================
+--- linux.orig/hpc/task.c	2007-01-08 19:31:59.000000000 +0100
++++ linux/hpc/task.c	2007-01-08 19:32:17.000000000 +0100
+@@ -223,22 +223,6 @@
+ 	return 0;
+ }
+ 
+-/**
+- * task_wait_contact - wait until the process got a contact with deputy
+- **/
+-static inline void task_wait_contact(task_t *p)
+-{
+-	DECLARE_WAITQUEUE(wait, p);
+-
+-	add_wait_queue(&p->om.wait_dist, &wait);
+-	while (!p->om.contact)
+-	{
+-		set_current_state(TASK_UNINTERRUPTIBLE);
+-		schedule();
+-	}
+-	remove_wait_queue(&p->om.wait_dist, &wait);
+-	set_current_state(TASK_RUNNING);
+-}
+ 
+ /**
+  * task_register_migration - register a migration for this process
+Index: linux/hpc/Makefile
+===================================================================
+--- linux.orig/hpc/Makefile	2007-01-08 19:35:16.000000000 +0100
++++ linux/hpc/Makefile	2007-01-08 19:35:23.000000000 +0100
+@@ -2,7 +2,7 @@
+ obj-$(CONFIG_KCOMD)     += kcomd.o
+ 
+ # core part
+-obj-$(CONFIG_OPENMOSIX)		+= kernel.o task.o kcom.o
++obj-$(CONFIG_OPENMOSIX)		+= kernel.o task.o kcom.o ptrace.o
+ obj-$(CONFIG_OPENMOSIX)		+= remote.o deputy.o copyuser.o files.o syscalls.o
+ obj-$(CONFIG_OPENMOSIX)		+= migrecv.o migsend.o migctrl.o
+ obj-$(CONFIG_OPENMOSIX)		+= service.o
+Index: linux/kernel/exit.c
+===================================================================
+--- linux.orig/kernel/exit.c	2007-01-09 18:55:59.000000000 +0100
++++ linux/kernel/exit.c	2007-01-10 20:01:32.000000000 +0100
+@@ -1018,6 +1018,8 @@
+ 
+ static int eligible_child(pid_t pid, int options, task_t *p)
+ {
++	unsigned long ptrace;
++
+ 	if (pid > 0) {
+ 		if (p->pid != pid)
+ 			return 0;
+@@ -1033,7 +1035,14 @@
+ 	 * Do not consider detached threads that are
+ 	 * not ptraced:
+ 	 */
+-	if (p->exit_signal == -1 && !p->ptrace)
++	ptrace = p->ptrace;
++
++#ifdef CONFIG_OPENMOSIX
++	if (task_test_dflags(p, DDEPUTY))
++		ptrace = p->om.remote_ptrace;
++#endif
++
++	if (p->exit_signal == -1 && !ptrace)
+ 		return 0;
+ 
+ 	/* Wait for all children (clone and not) if __WALL is set;
+@@ -1254,10 +1263,24 @@
+ 			     int __user *stat_addr, struct rusage __user *ru)
+ {
+ 	int retval, exit_code;
+-
++	unsigned long ptrace;
++	long state;
++	long exit_state;
++
++	ptrace = p->ptrace;
++	state = p->state;
++	exit_state = p->exit_state;
++
++#ifdef CONFIG_OPENMOSIX
++	if (task_test_dflags(p, DDEPUTY)) {
++		ptrace = p->om.remote_ptrace;
++		state = p->om.remote_state;
++		exit_state = p->om.remote_exit_state;
++	}
++#endif
+ 	if (!p->exit_code)
+ 		return 0;
+-	if (delayed_group_leader && !(p->ptrace & PT_PTRACED) &&
++	if (delayed_group_leader && !(ptrace & PT_PTRACED) &&
+ 	    p->signal && p->signal->group_stop_count > 0)
+ 		/*
+ 		 * A group stop is in progress and this is the group leader.
+@@ -1278,11 +1301,11 @@
+ 	if (unlikely(noreap)) {
+ 		pid_t pid = p->pid;
+ 		uid_t uid = p->uid;
+-		int why = (p->ptrace & PT_PTRACED) ? CLD_TRAPPED : CLD_STOPPED;
++		int why = (ptrace & PT_PTRACED) ? CLD_TRAPPED : CLD_STOPPED;
+ 
+ 		exit_code = p->exit_code;
+ 		if (unlikely(!exit_code) ||
+-		    unlikely(p->state & TASK_TRACED))
++		    unlikely(state & TASK_TRACED))
+ 			goto bail_ref;
+ 		return wait_noreap_copyout(p, pid, uid,
+ 					   why, (exit_code << 8) | 0x7f,
+@@ -1297,7 +1320,7 @@
+ 	 * race with the EXIT_ZOMBIE case.
+ 	 */
+ 	exit_code = xchg(&p->exit_code, 0);
+-	if (unlikely(p->exit_state)) {
++	if (unlikely(exit_state)) {
+ 		/*
+ 		 * The task resumed and then died.  Let the next iteration
+ 		 * catch it in EXIT_ZOMBIE.  Note that exit_code might
+@@ -1413,9 +1436,17 @@
+ 
+ static inline int my_ptrace_child(struct task_struct *p)
+ {
+-	if (!(p->ptrace & PT_PTRACED))
++	unsigned long ptrace;
++
++	ptrace = p->ptrace;
++
++#ifdef CONFIG_OPENMOSIX
++	if (task_test_dflags(p, DDEPUTY))
++		ptrace = p->om.remote_ptrace;
++#endif
++	if (!(ptrace & PT_PTRACED))
+ 		return 0;
+-	if (!(p->ptrace & PT_ATTACHED))
++	if (!(ptrace & PT_ATTACHED))
+ 		return 1;
+ 	/*
+ 	 * This child was PTRACE_ATTACH'd.  We should be seeing it only if
+@@ -1448,6 +1479,9 @@
+ 		struct task_struct *p;
+ 		struct list_head *_p;
+ 		int ret;
++		long state;
++		long exit_state;
++
+ 
+ 		list_for_each(_p,&tsk->children) {
+ 			p = list_entry(_p,struct task_struct,sibling);
+@@ -1456,7 +1490,17 @@
+ 			if (!ret)
+ 				continue;
+ 
+-			switch (p->state) {
++			state = p->state;
++			exit_state = p->exit_state;
++
++#ifdef CONFIG_OPENMOSIX
++			if (task_test_dflags(p, DDEPUTY)) {
++				state = p->om.remote_state;
++				exit_state = p->om.remote_exit_state;
++			}
++#endif
++			switch (state) {
++
+ 			case TASK_TRACED:
+ 				/*
+ 				 * When we hit the race with PTRACE_ATTACH,
+@@ -1490,10 +1534,10 @@
+ 				break;
+ 			default:
+ 			// case EXIT_DEAD:
+-				if (p->exit_state == EXIT_DEAD)
++				if (exit_state == EXIT_DEAD)
+ 					continue;
+ 			// case EXIT_ZOMBIE:
+-				if (p->exit_state == EXIT_ZOMBIE) {
++				if (exit_state == EXIT_ZOMBIE) {
+ 					/*
+ 					 * Eligible but we cannot release
+ 					 * it yet:

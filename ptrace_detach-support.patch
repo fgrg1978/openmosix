@@ -1,0 +1,148 @@
+Subject: [patch @num@/@total@] @name@
+
+This patch allow the PTRACE_DETACH to be processed from a deputy to a
+remote
+
+---
+ hpc/kcomd.c             |    7 +++++++
+ hpc/ptrace.c            |   44 ++++++++++++++++++++++++++++++++++++++++++--
+ include/hpc/protocol.h  |    1 +
+ include/hpc/prototype.h |    2 ++
+ kernel/ptrace.c         |   13 +++++++++++++
+ 5 files changed, 65 insertions(+), 2 deletions(-)
+
+
+Index: linux/hpc/kcomd.c
+===================================================================
+--- linux.orig/hpc/kcomd.c	2007-01-10 22:09:52.000000000 +0100
++++ linux/hpc/kcomd.c	2007-01-10 22:31:34.000000000 +0100
+@@ -359,6 +359,13 @@
+ 		.handle_pkt = remote_set_traced,
+ 		.cmd_flags = KCOM_ASYNC_SIMPLE,
+ 		.name = "Set Remote TASK_TRACED"},
++
++        /* detach the task*/
++	[KCOM_L1_CMD_INDEX(KCOM_L1_PTRACE_DETACH)] = {
++		.handle_pkt = remote_ptrace_detach,
++		.cmd_flags = KCOM_ASYNC_SIMPLE,
++		.recv_size = sizeof( int ),
++		.name = "Deputy Ptrace Detach"},
+ };
+ EXPORT_SYMBOL_GPL(kcomd_l1_handlers);
+ 
+Index: linux/hpc/ptrace.c
+===================================================================
+--- linux.orig/hpc/ptrace.c	2007-01-10 22:09:23.000000000 +0100
++++ linux/hpc/ptrace.c	2007-01-11 14:33:52.000000000 +0100
+@@ -240,3 +239,45 @@
+ 	return 0;
+ }
++
++void deputy_ptrace_detach(struct task_struct *child, unsigned int data)
++{
++	struct kcom_task *task;
++	struct sockaddr_in *dest_ptr=(void *)child->om.whereto;
++	int ret;
++
++	task = kcom_home_task_find(child->pid);
++
++	if (!task)
++		return;
++
++	ret = __kcom_send_command(task, KCOM_L1_PTRACE_DETACH, sizeof(data), (char*)&data, 0, dest_ptr, NULL);
++}
++
++/* This function is x86_64 and i386 compatible, dk about others ... */
++extern void ptrace_disable(struct task_struct *child);
++
++int remote_ptrace_detach(struct kcom_node *node, const struct kcom_pkt *const pkt)
++{
++	struct kcom_task *tsk = __find_task_for_packet(pkt, node, NULL);
++	unsigned int *data;
++
++	if (!tsk)
++		return -ESRCH;
++
++	data = (unsigned int *) pkt->data;
++
++	ptrace_disable(tsk->task);
++
++	read_lock(&tasklist_lock);
++	tsk->task->ptrace = 0;
++	read_unlock(&tasklist_lock);
++
++	if(TASK_TRACED == tsk->task->state)
++		ptrace_unlink(tsk->task);
++
++	if (tsk->task->exit_state != EXIT_ZOMBIE)
++		wake_up_process(tsk->task);
++	return 0;
++}
++
+ 
+Index: linux/include/hpc/protocol.h
+===================================================================
+--- linux.orig/include/hpc/protocol.h	2007-01-10 21:57:52.000000000 +0100
++++ linux/include/hpc/protocol.h	2007-01-10 21:58:05.000000000 +0100
+@@ -117,6 +117,7 @@
+ 	KCOM_L1_PTRACE_CALL,	       /* execute ptrace on deputy       */
+ 	KCOM_L1_GET_TASK_STATE,	       /*  get the remote task state     */
+ 	KCOM_L1_SET_TRACED,	       /* called to set to TASK_TRACED   */
++	KCOM_L1_PTRACE_DETACH,	       /* called to set the task free(tm)*/
+ 
+ 	KCOM_L1_CMD_MAX,
+ 
+Index: linux/include/hpc/prototype.h
+===================================================================
+--- linux.orig/include/hpc/prototype.h	2007-01-10 22:22:38.000000000 +0100
++++ linux/include/hpc/prototype.h	2007-01-10 22:22:54.000000000 +0100
+@@ -140,4 +140,6 @@
+ extern void deputy_set_remote_traced(struct task_struct *child);
+ extern int remote_get_task_state(struct kcom_node* node, const struct kcom_pkt *const pkt);
+ extern int deputy_get_remote_task_state(struct task_struct *child, struct omp_get_task_state *s);
++void deputy_ptrace_detach(struct task_struct *child, unsigned int data);
++int remote_ptrace_detach(struct kcom_node *node, const struct kcom_pkt *const pkt);
+ #endif /* _HPC_PROTOTYPE_H */
+Index: linux/kernel/ptrace.c
+===================================================================
+--- linux.orig/kernel/ptrace.c	2007-01-10 21:58:51.000000000 +0100
++++ linux/kernel/ptrace.c	2007-01-11 14:30:43.000000000 +0100
+@@ -72,7 +72,11 @@
+  */
+ void __ptrace_unlink(task_t *child)
+ {
++#ifndef CONFIG_OPENMOSIX
+ 	BUG_ON(!child->ptrace);
++#else
++	BUG_ON(!child->ptrace && !task_test_dflags(child, DDEPUTY));
++#endif
+ 
+ 	child->ptrace = 0;
+ 	if (!list_empty(&child->ptrace_list)) {
+@@ -272,6 +276,7 @@
+ 	child->exit_code = data;
+ 	/* .. re-parent .. */
+ 	__ptrace_unlink(child);
++
+ 	/* .. and wake it up. */
+ 	if (child->exit_state != EXIT_ZOMBIE)
+ 		wake_up_process(child);
+@@ -286,10 +291,18 @@
+ 	ptrace_disable(child);
+ 
+ 	write_lock_irq(&tasklist_lock);
++#ifndef CONFIG_OPENMOSIX
+ 	if (child->ptrace)
++#else
++	if (child->ptrace || task_test_dflags(child, DDEPUTY))
++#endif
+ 		__ptrace_detach(child, data);
+ 	write_unlock_irq(&tasklist_lock);
+ 
++#ifdef CONFIG_OPENMOSIX
++	if(task_test_dflags(child, DDEPUTY))
++		deputy_ptrace_detach(child, data);
++#endif
+ 	return 0;
+ }
+ 
